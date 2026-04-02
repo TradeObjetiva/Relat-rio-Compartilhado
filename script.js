@@ -415,33 +415,95 @@ function processCsv(content, originalFileName) {
     return null;
   }
 
-  const headers = parsed[1].map((value) => normalizeHeader(value));
+  // A Deluc costuma ter a primeira linha como metadados/id e a segunda como cabeçalho (parsed[1])
+  const rawHeaders = parsed[1] || [];
+  const normalizedHeaders = rawHeaders.map(h => normalizeHeader(h));
+  
+  // Lista de colunas a serem ignoradas (Blacklist conforme solicitado)
+  const BLACKLIST = [
+    'ID DA TAREFA',
+    'SECAO',
+    'FILIAL',
+    'FOTO DO MIX',
+    'O QUE SE RESOLVEU COM O GERENTE?',
+    'POSICAO ATUAL'
+  ];
 
-  // Sanity Check: Verifica se pelo menos alguma das colunas esperadas existe
-  const expectedSources = EXPORT_MODEL.map(m => normalizeHeader(m.source));
-  const foundRequired = expectedSources.some(src => headers.includes(src));
-
-  if (!foundRequired) {
-    showAlert('Aviso de Incompatibilidade', 'Não encontramos as colunas padrões da Pesquisa Deluc neste arquivo. O relatório gerado pode conter dados inconsistentes ou completamente vazios.', 'warning');
-  }
-
+  // Filtramos apenas as linhas do corpo que tenham algum conteúdo real
   const body = parsed.slice(2).filter((row) => row.some((cell) => String(cell || '').trim() !== ''));
 
+  // Mapeamento de regras do modelo para consulta rápida
+  const mappingRules = {};
+  EXPORT_MODEL.forEach(rule => {
+    const srcNorm = normalizeHeader(rule.source);
+    if (!mappingRules[srcNorm]) mappingRules[srcNorm] = [];
+    mappingRules[srcNorm].push(rule);
+  });
+
+  // Transforma os dados: se estiver no modelo, usa o nome/transformação do modelo. Senão, mantém original.
   const transformed = body.map((row) => {
     const obj = {};
-
-    for (const rule of EXPORT_MODEL) {
-      const sourceIndex = headers.indexOf(normalizeHeader(rule.source));
-      const rawValue = sourceIndex >= 0 ? String(row[sourceIndex] ?? '').trim() : '';
-      obj[rule.export] = applyTransform(rawValue, rule.transform);
-    }
-
+    rawHeaders.forEach((header, index) => {
+      const normH = normalizedHeaders[index];
+      const val = String(row[index] ?? '').trim();
+      
+      // Se estiver na blacklist, pula
+      if (BLACKLIST.includes(normH)) return;
+      
+      const rules = mappingRules[normH];
+      if (rules) {
+        // Aplica as regras do modelo (pode gerar mais de uma coluna, ex: DATA e DATA DO DIA)
+        rules.forEach(rule => {
+          obj[rule.export] = applyTransform(val, rule.transform);
+        });
+      } else {
+        // Se não houver regra, mantém o nome original bruto
+        obj[header] = val;
+      }
+    });
     return obj;
   });
 
-  const exportColumns = EXPORT_MODEL
-    .map((item) => item.export)
-    .filter((col) => transformed.some((row) => String(row[col] ?? '').trim() !== ''));
+  // Determinar quais colunas de fato iremos exportar mantendo a ordem do arquivo
+  const mainColumns = [];
+  const extraColumns = [];
+
+  rawHeaders.forEach((header, index) => {
+    const normH = normalizedHeaders[index];
+    if (BLACKLIST.includes(normH)) return;
+    
+    const rules = mappingRules[normH];
+    if (rules) {
+      rules.forEach((rule, rIdx) => {
+        // Se for a segunda regra para uma mesma origem (ex: DATA DO DIA), jogamos para o final 
+        // para que não empurre as outras colunas originais de suas posições
+        if (rIdx > 0 || rule.export === 'DATA DO DIA') {
+          if (!extraColumns.includes(rule.export)) extraColumns.push(rule.export);
+        } else {
+          if (!mainColumns.includes(rule.export)) mainColumns.push(rule.export);
+        }
+      });
+    } else {
+      // Colunas que não estão no modelo mas têm dados seguem o fluxo principal
+      if (!mainColumns.includes(header)) mainColumns.push(header);
+    }
+  });
+
+  let allPossibleColumns = [...mainColumns, ...extraColumns];
+
+  // Regra de Negócio: 'DATA DO DIA' deve vir após 'TEM SKU VENCENDO EM 60 DIAS?' se ambas existirem
+  const targetCol = 'TEM SKU VENCENDO EM 60 DIAS?';
+  const dataCol = 'DATA DO DIA';
+  if (allPossibleColumns.includes(dataCol) && allPossibleColumns.includes(targetCol)) {
+    allPossibleColumns = allPossibleColumns.filter(c => c !== dataCol);
+    const targetIdx = allPossibleColumns.indexOf(targetCol);
+    allPossibleColumns.splice(targetIdx + 1, 0, dataCol);
+  }
+
+  // Filtragem final: Manter apenas colunas que possuem dados em pelo menos uma linha processada
+  const exportColumns = allPossibleColumns.filter(col => {
+    return transformed.some(row => String(row[col] ?? '').trim() !== '');
+  });
 
   return { originalFileName, rows: transformed, columns: exportColumns };
 }
@@ -516,14 +578,26 @@ function parseDelimitedCsv(text, delimiter) {
 
 function renderMapping(exportColumns) {
   mappingTableBody.innerHTML = '';
-  EXPORT_MODEL.filter(item => exportColumns.includes(item.export)).forEach((item) => {
+  
+  exportColumns.forEach(colName => {
+    // Busca se existe tradução no modelo reserva de minas
+    const rule = EXPORT_MODEL.find(m => m.export === colName);
+    
     const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td><strong>${escapeHtml(item.export)}</strong></td>
-      <td>${item.transform === 'date'
-        ? `<span class="badge">Sintetizada de</span> ${escapeHtml(item.source)}`
-        : escapeHtml(item.source)}</td>
-    `;
+    if (rule) {
+      tr.innerHTML = `
+        <td><strong>${escapeHtml(colName)}</strong></td>
+        <td>${rule.transform === 'date'
+          ? `<span class="badge">Sintetizada de</span> ${escapeHtml(rule.source)}`
+          : escapeHtml(rule.source)}</td>
+      `;
+    } else {
+      // Coluna extra que não estava no modelo original mas tem dado
+      tr.innerHTML = `
+        <td><strong>${escapeHtml(colName)}</strong></td>
+        <td>${escapeHtml(colName)} <span class="badge" style="background:#555">Original</span></td>
+      `;
+    }
     mappingTableBody.appendChild(tr);
   });
 }
